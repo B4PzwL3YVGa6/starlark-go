@@ -78,18 +78,22 @@ func (thread *Thread) TopFrame() *Frame { return thread.frame }
 // It is not a true starlark.Value.
 type StringDict map[string]Value
 
-func (d StringDict) String() string {
+// Keys returns a new sorted slice of d's keys.
+func (d StringDict) Keys() []string {
 	names := make([]string, 0, len(d))
 	for name := range d {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	return names
+}
 
+func (d StringDict) String() string {
 	var buf bytes.Buffer
 	path := make([]Value, 0, 4)
 	buf.WriteByte('{')
 	sep := ""
-	for _, name := range names {
+	for _, name := range d.Keys() {
 		buf.WriteString(sep)
 		buf.WriteString(name)
 		buf.WriteString(": ")
@@ -119,6 +123,11 @@ type Frame struct {
 	locals   []Value         // local variables, for debugger
 }
 
+// TODO for stargo.
+func NewFrame(parent *Frame, callable Callable) *Frame {
+	return &Frame{parent: parent, callable: callable}
+}
+
 // The Frames of a thread are structured as a spaghetti stack, not a
 // slice, so that an EvalError can copy a stack efficiently and immutably.
 // In hindsight using a slice would have led to a more convenient API.
@@ -138,7 +147,9 @@ func (fr *Frame) Position() syntax.Position {
 	case *Function:
 		// Starlark function
 		return c.funcode.Position(fr.callpc) // position of active call
-	case interface{ Position() syntax.Position }:
+	case interface {
+		Position() syntax.Position
+	}:
 		// If a built-in Callable defines
 		// a Position method, use it.
 		return c.Position()
@@ -397,8 +408,8 @@ func listExtend(x *List, y Iterable) {
 	}
 }
 
-// getAttr implements x.dot.
-func getAttr(fr *Frame, x Value, name string) (Value, error) {
+// getAttr implements x.name.
+func getAttr(x Value, name string) (Value, error) {
 	// field or method?
 	if x, ok := x.(HasAttrs); ok {
 		if v, err := x.Attr(name); v != nil || err != nil {
@@ -410,16 +421,18 @@ func getAttr(fr *Frame, x Value, name string) (Value, error) {
 }
 
 // setField implements x.name = y.
-func setField(fr *Frame, x Value, name string, y Value) error {
+func setField(x Value, name string, y Value) error {
 	if x, ok := x.(HasSetField); ok {
 		err := x.SetField(name, y)
 		return err
 	}
+
 	return fmt.Errorf("can't assign to .%s field of %s", name, x.Type())
 }
 
 // getIndex implements x[y].
-func getIndex(fr *Frame, x, y Value) (Value, error) {
+
+func getIndex(x, y Value) (Value, error) {
 	switch x := x.(type) {
 	case Mapping: // dict
 		z, found, err := x.Get(y)
@@ -437,6 +450,9 @@ func getIndex(fr *Frame, x, y Value) (Value, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s index: %s", x.Type(), err)
 		}
+		if n < 0 {
+			return nil, fmt.Errorf("cannot index %s: no length", x.Type())
+		}
 		if i < 0 {
 			i += n
 		}
@@ -450,7 +466,7 @@ func getIndex(fr *Frame, x, y Value) (Value, error) {
 }
 
 // setIndex implements x[y] = z.
-func setIndex(fr *Frame, x, y, z Value) error {
+func setIndex(x, y, z Value) error {
 	switch x := x.(type) {
 	case HasSetKey:
 		if err := x.SetKey(y, z); err != nil {
@@ -498,6 +514,14 @@ func Unary(op syntax.Token, x Value) (Value, error) {
 	case syntax.NOT:
 		return !x.Truth(), nil
 	}
+
+	if x, ok := x.(HasUnary); ok {
+		y, err := x.Unary(op)
+		if y != nil || err != nil {
+			return y, err
+		}
+	}
+
 	return nil, fmt.Errorf("unknown unary op: %s %s", op, x.Type())
 }
 

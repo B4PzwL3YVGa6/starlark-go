@@ -37,9 +37,27 @@ import (
 const debug = false // TODO(adonovan): use a bitmap of options; and regexp to match files
 
 // Increment this to force recompilation of saved bytecode files.
-const Version = 5
+const Version = 6
 
 type Opcode uint8
+
+// OBSOLETE
+//
+// Addressing
+//
+// Addressing is a special compilation mode used by stargo and enabled
+// by resolve.AllowAddressing. It causes the compiler to emit
+// different code for address expressions of these forms,
+//
+//    &(expr.f[i].g)          expr ATTR<f> i INDEX ATTR<g> ADDRESS
+//    (expr.f[i].g).x = y     expr ATTR<f> i INDEX ATTR<g> y SETFIELD<x>
+//    (expr.f[i].g)[j] = y    expr ATTR<f> i INDEX ATTR<g> y j SETINDEX
+//    _ = expr.f[i].g         expr ATTR<f> i INDEX ATTR<g> VALUE
+//
+// in which a sequence of ATTR and INDEX operations is applied to an
+// arbitrary value, optionally followed by an operation on an address:
+// ADDRESS, SETFIELD, or SETINDEX, or VALUE.
+// TODO
 
 // "x DUP x x" is a "stack picture" that describes the state of the
 // stack before and after execution of the instruction.
@@ -94,13 +112,15 @@ const (
 	NOT         //          value NOT bool
 	RETURN      //          value RETURN -
 	SETINDEX    //        a i new SETINDEX -
-	INDEX       //            a i INDEX elem
+	INDEX       //            a i INDEX elem        elem = a[i]
 	SETDICT     // dict key value SETDICT -
 	SETDICTUNIQ // dict key value SETDICTUNIQ -
 	APPEND      //      list elem APPEND -
 	SLICE       //   x lo hi step SLICE slice
-	INPLACE_ADD //            x y INPLACE_ADD z      where z is x+y or x.extend(y)
+	INPLACE_ADD //            x y INPLACE_ADD z     where z is x+y or x.extend(y)
 	MAKEDICT    //              - MAKEDICT dict
+	VALUE       //            var VALUE value       value   of Variable; identity for all other values [stargo only]
+	ADDRESS     //            var VALUE addr        address of Variable;    fails for all other values [stargo only]
 
 	// --- opcodes with an argument must go below this line ---
 
@@ -186,6 +206,7 @@ var opcodeNames = [...]string{
 	POP:         "pop",
 	PREDECLARED: "predeclared",
 	RETURN:      "return",
+	VALUE:       "value",
 	SETDICT:     "setdict",
 	SETDICTUNIQ: "setdictuniq",
 	SETFIELD:    "setfield",
@@ -209,6 +230,7 @@ const variableStackEffect = 0x7f
 // stackEffect records the effect on the size of the operand stack of
 // each kind of instruction. For some instructions this requires computation.
 var stackEffect = [...]int8{
+	ADDRESS:     0,
 	AMP:         -1,
 	APPEND:      -2,
 	ATTR:        0,
@@ -266,8 +288,11 @@ var stackEffect = [...]int8{
 	SLICE:       -3,
 	STAR:        -1,
 	TRUE:        +1,
+	UMINUS:      0,
 	UNIVERSAL:   +1,
 	UNPACK:      variableStackEffect,
+	UPLUS:       0,
+	VALUE:       0,
 }
 
 func (op Opcode) String() string {
@@ -998,18 +1023,22 @@ func (fcomp *fcomp) stmt(stmt syntax.Stmt) {
 			switch lhs := unparen(stmt.LHS).(type) {
 			case *syntax.Ident:
 				// x = ...
-				fcomp.lookup(lhs)
+				fcomp.lookup(lhs) // no way to compile this in l-mode
 				set = func() {
 					fcomp.set(lhs)
 				}
 
 			case *syntax.IndexExpr:
 				// x[y] = ...
-				fcomp.expr(lhs.X)
+				fcomp.addr(lhs.X)
 				fcomp.expr(lhs.Y)
 				fcomp.emit(DUP2)
 				fcomp.setPos(lhs.Lbrack)
 				fcomp.emit(INDEX)
+				if resolve.AllowAddressing {
+					fcomp.emit(VALUE)
+				}
+
 				set = func() {
 					fcomp.setPos(lhs.Lbrack)
 					fcomp.emit(SETINDEX)
@@ -1017,11 +1046,15 @@ func (fcomp *fcomp) stmt(stmt syntax.Stmt) {
 
 			case *syntax.DotExpr:
 				// x.f = ...
-				fcomp.expr(lhs.X)
+				fcomp.addr(lhs.X)
 				fcomp.emit(DUP)
 				name := fcomp.pcomp.nameIndex(lhs.Name.Name)
 				fcomp.setPos(lhs.Dot)
 				fcomp.emit1(ATTR, name)
+				if resolve.AllowAddressing {
+					fcomp.emit(VALUE)
+				}
+
 				set = func() {
 					fcomp.setPos(lhs.Dot)
 					fcomp.emit1(SETFIELD, name)
@@ -1141,7 +1174,7 @@ func (fcomp *fcomp) assign(pos syntax.Position, lhs syntax.Expr) {
 
 	case *syntax.IndexExpr:
 		// x[y] = rhs
-		fcomp.expr(lhs.X)
+		fcomp.addr(lhs.X)
 		fcomp.emit(EXCH)
 		fcomp.expr(lhs.Y)
 		fcomp.emit(EXCH)
@@ -1150,7 +1183,7 @@ func (fcomp *fcomp) assign(pos syntax.Position, lhs syntax.Expr) {
 
 	case *syntax.DotExpr:
 		// x.f = rhs
-		fcomp.expr(lhs.X)
+		fcomp.addr(lhs.X)
 		fcomp.emit(EXCH)
 		fcomp.setPos(lhs.Dot)
 		fcomp.emit1(SETFIELD, fcomp.pcomp.nameIndex(lhs.Name.Name))
@@ -1165,6 +1198,31 @@ func (fcomp *fcomp) assignSequence(pos syntax.Position, lhs []syntax.Expr) {
 	fcomp.emit1(UNPACK, uint32(len(lhs)))
 	for i := range lhs {
 		fcomp.assign(pos, lhs[i])
+	}
+}
+
+// addr emits code for a chain of x.f and a[i] operations such as a.f[i].g[j].
+//
+// In Addressing mode, all toplevel calls to addr() (a chain of ATTR and
+// INDEX ops) must be followed by one of ADDRESS, SETFIELD, SETINDEX, or VALUE.
+func (fcomp *fcomp) addr(e syntax.Expr) {
+	switch e := e.(type) {
+	case *syntax.ParenExpr:
+		fcomp.addr(e.X)
+
+	case *syntax.DotExpr:
+		fcomp.addr(e.X)
+		fcomp.setPos(e.Dot)
+		fcomp.emit1(ATTR, fcomp.pcomp.nameIndex(e.Name.Name))
+
+	case *syntax.IndexExpr:
+		fcomp.addr(e.X)
+		fcomp.expr(e.Y)
+		fcomp.setPos(e.Lbrack)
+		fcomp.emit(INDEX)
+
+	default:
+		fcomp.expr(e)
 	}
 }
 
@@ -1205,10 +1263,10 @@ func (fcomp *fcomp) expr(e syntax.Expr) {
 		fcomp.block = done
 
 	case *syntax.IndexExpr:
-		fcomp.expr(e.X)
-		fcomp.expr(e.Y)
-		fcomp.setPos(e.Lbrack)
-		fcomp.emit(INDEX)
+		fcomp.addr(e)
+		if resolve.AllowAddressing {
+			fcomp.emit(VALUE)
+		}
 
 	case *syntax.SliceExpr:
 		fcomp.setPos(e.Lbrack)
@@ -1253,9 +1311,15 @@ func (fcomp *fcomp) expr(e syntax.Expr) {
 		}
 
 	case *syntax.UnaryExpr:
-		fcomp.expr(e.X)
+		if e.Op == syntax.AMP {
+			fcomp.addr(e.X)
+		} else {
+			fcomp.expr(e.X)
+		}
 		fcomp.setPos(e.OpPos)
 		switch e.Op {
+		case syntax.AMP:
+			fcomp.emit(ADDRESS)
 		case syntax.MINUS:
 			fcomp.emit(UMINUS)
 		case syntax.PLUS:
@@ -1315,9 +1379,10 @@ func (fcomp *fcomp) expr(e syntax.Expr) {
 		}
 
 	case *syntax.DotExpr:
-		fcomp.expr(e.X)
-		fcomp.setPos(e.Dot)
-		fcomp.emit1(ATTR, fcomp.pcomp.nameIndex(e.Name.Name))
+		fcomp.addr(e)
+		if resolve.AllowAddressing {
+			fcomp.emit(VALUE)
+		}
 
 	case *syntax.CallExpr:
 		fcomp.call(e)

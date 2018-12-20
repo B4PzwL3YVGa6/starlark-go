@@ -315,10 +315,18 @@ func unpackOneArg(v Value, ptr interface{}) error {
 		if !reflect.TypeOf(v).AssignableTo(param.Type()) {
 			// Detect mistakes by caller.
 			if !param.Type().AssignableTo(reflect.TypeOf(new(Value)).Elem()) {
-				log.Fatalf("internal error: invalid pointer type: %T", ptr)
+				log.Panicf("internal error: invalid pointer type: %T", ptr)
 			}
-			// Assume it's safe to call Type() on a zero instance.
-			paramType := param.Interface().(Value).Type()
+			paramType := param.Type().String()
+			if param.Kind() != reflect.Interface {
+				// Concrete type: show Starlark type name.
+				// It is not safe to call Type() on a zero instance,
+				// though it works for many types.
+				func() {
+					defer func() { recover() }()
+					paramType = param.Interface().(Value).Type()
+				}()
+			}
 			return fmt.Errorf("got %s, want %s", v.Type(), paramType)
 		}
 		param.Set(reflect.ValueOf(v))

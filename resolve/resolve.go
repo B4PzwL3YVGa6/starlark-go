@@ -96,6 +96,7 @@ var (
 	AllowGlobalReassign = false // allow reassignment to globals declared in same file (deprecated)
 	AllowBitwise        = false // allow bitwise operations (&, |, ^, ~, <<, and >>)
 	AllowRecursion      = false // allow while statements and recursive functions
+	AllowAddressing     = false // allow &a.f and l-value addressing of a.f[i].g
 )
 
 // File resolves the specified file.
@@ -647,6 +648,18 @@ func (r *resolver) expr(e syntax.Expr) {
 		if !AllowBitwise && e.Op == syntax.TILDE {
 			r.errorf(e.OpPos, doesnt+"support bitwise operations")
 		}
+		if e.Op == syntax.AMP {
+			if !AllowAddressing {
+				r.errorf(e.OpPos, doesnt+"support address operations")
+			} else {
+				switch unparen(e.X).(type) {
+				case *syntax.DotExpr, *syntax.IndexExpr:
+					// ok
+				default:
+					r.errorf(e.OpPos, "& operator can be applied only to &x.f or &a[i]")
+				}
+			}
+		}
 		r.expr(e.X)
 
 	case *syntax.BinaryExpr:
@@ -877,4 +890,14 @@ func (r *resolver) lookupLexical(id *syntax.Ident, env *block) (bind binding) {
 		env.bind(id.Name, bind)
 	}
 	return bind
+}
+
+func unparen(e syntax.Expr) syntax.Expr {
+	for {
+		paren, ok := e.(*syntax.ParenExpr)
+		if !ok {
+			return e
+		}
+		e = paren.X
+	}
 }

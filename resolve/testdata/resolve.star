@@ -275,3 +275,27 @@ U = 1 # ok (legacy)
 # https://github.com/bazelbuild/starlark/starlark/issues/21
 def f(**kwargs): pass
 f(a=1, a=1) ### `keyword argument a repeated`
+
+---
+_ = &U.x ### "dialect does not support address operations"
+
+---
+# The & operator can be applied only to &x.f or &a[i].
+# option:addressing
+
+x, i, j = U
+
+def use(x): pass
+
+# ok 
+use(&x.f)
+use(&x[i])
+use(&x.f[i].g[j])
+use(&(x.f[i].g[j]))
+use(&x[i])
+(&x.f).f = 1
+
+# bad
+use(&x)      ### `& operator can be applied only to &x.f or &a\[i\]`
+use(&(1+2))  ### `& operator can be applied only to &x.f or &a\[i\]`
+use(&x(x))   ### `& operator can be applied only to &x.f or &a\[i\]`

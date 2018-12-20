@@ -177,6 +177,8 @@ var (
 
 // An Indexable is a sequence of known length that supports efficient random access.
 // It is not necessarily iterable.
+//
+// Len may return -1 to indicate that a particular value is not indexable.
 type Indexable interface {
 	Value
 	Index(i int) Value // requires 0 <= i < Len()
@@ -186,7 +188,12 @@ type Indexable interface {
 // A Sliceable is a sequence that can be cut into pieces with the slice operator (x[i:j:step]).
 //
 // All native indexable objects are sliceable.
-// This is a separate interface for backwards-compatibility.
+//
+// This is a separate interface from Indexable for backwards-compatibility.
+// Although it is possible to implement the selection of the elements
+// x[i:j:step] in a generic way using only the Indexable interface,
+// the creation of the result value (string, tuple, list, etc)
+// varies by type.
 type Sliceable interface {
 	Indexable
 	// For positive strides (step > 0), 0 <= start <= end <= n.
@@ -275,6 +282,17 @@ const (
 	Right Side = true
 )
 
+// A HasUnary value may be used as either operand of these unary operators:
+//     +   -   ~
+//
+// An implementation may decline to handle an operation by returning (nil, nil).
+// For this reason, clients should always call the standalone Unary(op, x)
+// function rather than calling the method directly.
+type HasUnary interface {
+	Value
+	Unary(op syntax.Token) (Value, error)
+}
+
 // A HasAttrs value has fields or methods that may be read by a dot expression (y = x.f).
 // Attribute names may be listed using the built-in 'dir' function.
 //
@@ -298,6 +316,31 @@ var (
 type HasSetField interface {
 	HasAttrs
 	SetField(name string, val Value) error
+}
+
+// A Variable represents a variable, also known as an l-value or
+// addressable expression. Variables are used only in stargo.
+//
+// For example, in the statement c = p.a.b, the expression p.a.b is an
+// ordinary "r-value", but in p.a.b = c, it represents an "l-value", a
+// memory location to be updated. The difference does not usually
+// matter in Starlark because all values are references, so the first
+// statement is treated as getfield(p.a, .b) and the second as
+// setfield(p.a, .b, c). But in stargo, p.a may denote a field of a Go
+// struct, in which case the first statement makes a copy of its
+// value, whereas the second.
+//
+// Also: &p.a.b TODO
+//
+// In general, and unlike Go which has types, in Starlark one cannot
+// tell statically whether a pointer has been traversed.  So, we make
+// all chains of a[i] and p.x operations end in ADDRESS (or SETFIELD
+// or SETINDEX), for an lvalue, or VALUE, for an rvalue.
+//
+type Variable interface {
+	Value
+	Address() Value
+	Value() Value
 }
 
 // NoneType is the type of None.  Its only legal value is None.
@@ -1196,3 +1239,37 @@ func Iterate(x Value) Iterator {
 	}
 	return nil
 }
+
+// A Module is a named collection of values, typically used to
+// represent something imported by a load statement.  It differs from
+// starlarkstruct primarily in that its string representation does not
+// enumerate its fields.
+//
+// TODO: rethink LoadStmt and Thread.Load function: make load(name)
+// with no arguments import an entire Module, not an explicit subset
+// of its members.  This is how imports work in Python and Go, where
+// the basic unit of import is the module or package (e.g. os) not the
+// individual value (e.g. os.Mkdir).
+// TODO: rename "assert.star" to just "assert".
+// Make it so that load("assert") works, with no need for load("assert", "assert").
+//
+// TODO: What should the API look like?
+// load("go") would import the Go builtins Module. Or "go" could be a predeclared Module.
+//
+// load("go", "net/http") could import a package "from Go".
+// Or load("net/http") could do it.  But then Go packages will conflict with starlark libs.
+// But perhaps that's ok because the app curates the set of available packages.
+type Module struct {
+	Name    string
+	Members StringDict
+}
+
+var _ HasAttrs = (*Module)(nil)
+
+func (m *Module) Attr(name string) (Value, error) { return m.Members[name], nil }
+func (m *Module) AttrNames() []string             { return m.Members.Keys() }
+func (m *Module) Freeze()                         { m.Members.Freeze() }
+func (m *Module) Hash() (uint32, error)           { return 0, fmt.Errorf("unhashable: %s", m.Type()) }
+func (m *Module) String() string                  { return fmt.Sprintf("<module %q>", m.Name) }
+func (m *Module) Truth() Bool                     { return true }
+func (m *Module) Type() string                    { return "module" }
